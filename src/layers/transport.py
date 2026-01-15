@@ -1,70 +1,100 @@
+# transport.py - Transport Layer with Buffer Management and Backpressure
+
 from config import RECEIVER_BUFFER_SIZE, TRANSPORT_HEADER_SIZE
 from models import Segment
+import struct
+import zlib
 
 class TransportLayer:
     def __init__(self, segment_payload_size):
-        """
-        L: Application data chunk size (Payload size)
-        """
         self.L = segment_payload_size
-        self.buffer_capacity = RECEIVER_BUFFER_SIZE  # 256 KB 
+        self.buffer_capacity = RECEIVER_BUFFER_SIZE  # 256 KB
         
-        # Receiver-side variables
-        self.receive_buffer = {}  # Stored as {seq_num: data}
+        # Receiver state
+        self.receive_buffer = {}  # {seq_num: data}
         self.current_buffer_usage = 0
+        self.next_expected_seq = 0
+        self.delivered_count = 0
         
-    # --- Sender Functions ---
+    # === SENDER SIDE ===
     
     def segmentize(self, total_data):
-        """
-        Splits 100 MB of data into chunks of size L and
-        creates Segment objects by adding an 8-byte header to each. 
-        """
+        """Segment data into L-sized chunks with 8-byte header."""
         segments = []
-        # Iterate over the data in L-byte chunks
         for i in range(0, len(total_data), self.L):
             chunk = total_data[i : i + self.L]
             seq_num = i // self.L
-            # Create segment (uses the structure in models.py)
             segments.append(Segment(seq_num, chunk))
         return segments
-
-    # --- Receiver Functions ---
-
-    def receive_segment(self, segment_obj):
+    
+    def compute_checksum(self, data):
+        """Compute CRC32 checksum for integrity verification."""
+        return zlib.crc32(data) & 0xFFFFFFFF
+    
+    def verify_integrity(self, data, expected_checksum):
+        """Verify data integrity using checksum."""
+        return self.compute_checksum(data) == expected_checksum
+    
+    # === RECEIVER SIDE ===
+    
+    def can_accept(self, data_size):
+        """Check if buffer has space for incoming segment."""
+        return self.current_buffer_usage + data_size <= self.buffer_capacity
+    
+    def get_buffer_usage_percent(self):
+        """Return buffer usage as percentage."""
+        return (self.current_buffer_usage / self.buffer_capacity) * 100
+    
+    def should_delay_ack(self):
+        """Delayed ACK when buffer > 80% full."""
+        return self.get_buffer_usage_percent() > 80
+    
+    def receive_segment(self, seq_num, data, checksum=None):
         """
-        Accepts a segment received from the link layer.
-        Returns False to signal backpressure if the buffer is full. 
+        Accept segment into buffer with integrity verification.
+        Returns: (success, should_ack)
         """
-        # Buffer occupancy check
-        # Assignment rule: Apply pressure to the link layer if the buffer is full.
-        if self.current_buffer_usage + len(segment_obj.data) <= self.buffer_capacity:
-            if segment_obj.seq_num not in self.receive_buffer:
-                self.receive_buffer[segment_obj.seq_num] = segment_obj.data
-                self.current_buffer_usage += len(segment_obj.data)
-            return True  # Segment successfully added to the buffer
+        data_size = len(data)
         
-        return False  # BUFFER FULL! (Backpressure should be triggered)
-
-    def is_backpressure_required(self):
+        # Integrity check if checksum provided
+        if checksum is not None:
+            if not self.verify_integrity(data, checksum):
+                return False, False  # Corrupted, reject
+        
+        # Backpressure: reject if buffer full
+        if not self.can_accept(data_size):
+            return False, False
+        
+        # Store if not duplicate
+        if seq_num not in self.receive_buffer:
+            self.receive_buffer[seq_num] = data
+            self.current_buffer_usage += data_size
+        
+        # Decide if ACK should be delayed
+        should_ack = not self.should_delay_ack()
+        
+        return True, should_ack
+    
+    def app_consume(self, max_bytes):
         """
-        The link layer should check this function and
-        slow down or stop transmission accordingly. 
+        Application layer consumes data from buffer.
+        Removes in-order delivered segments.
+        Returns bytes consumed.
         """
-        return self.current_buffer_usage >= self.buffer_capacity
-
-    def app_read_buffer(self):
-        """
-        Simulates the application layer reading and clearing data from the buffer.
-        In a real scenario, this operation frees buffer space and allows the flow to continue.
-        """
-        # This function will be used in the simulation to manage buffer occupancy
-        # For example: After a certain time, you may clear part of the buffer.
-        pass
-
-    def get_full_data(self):
-        """
-        Performs reassembly by combining all segments and checking integrity.
-        """
-        sorted_indices = sorted(self.receive_buffer.keys())
-        return b"".join([self.receive_buffer[i] for i in sorted_indices])
+        consumed = 0
+        
+        while self.next_expected_seq in self.receive_buffer and consumed < max_bytes:
+            data = self.receive_buffer[self.next_expected_seq]
+            data_size = len(data)
+            
+            del self.receive_buffer[self.next_expected_seq]
+            self.current_buffer_usage -= data_size
+            self.delivered_count += 1
+            consumed += data_size
+            self.next_expected_seq += 1
+        
+        return consumed
+    
+    def get_next_expected(self):
+        """Return next expected in-order sequence number."""
+        return self.next_expected_seq

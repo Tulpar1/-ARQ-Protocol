@@ -1,86 +1,116 @@
-import time
+# link.py - Link Layer with Selective Repeat ARQ
+
 from config import LINK_HEADER_SIZE
 from models import Frame
 
 class LinkLayer:
-    def __init__(self, window_size, timeout_interval=0.2):
-        """
-        window_size (W): Sender and receiver window size.
-        timeout_interval: Independent timeout duration for each frame.
-        """
+    def __init__(self, window_size, timeout_interval=0.150):
         self.W = window_size
         self.timeout_interval = timeout_interval
         
-        # --- Sender Variables ---
-        self.base = 0                       # Start of the window
-        self.next_seq_num = 0               # Next sequence number to send
-        self.send_window = {}               # {seq_num: {'frame': frame, 'timer': t, 'acked': bool}}
+        # === SENDER STATE ===
+        self.send_base = 0
+        self.next_seq_num = 0
+        self.send_window = {}  # {seq: {'frame': Frame, 'send_time': float, 'acked': bool}}
         
-        # --- Receiver Variables ---
-        self.expected_seq = 0               # First sequence number expected by the receiver
-        self.receive_buffer = {}            # Buffer for out-of-order packets
-
-    # --- Sender Functions ---
-
+        # === RECEIVER STATE ===
+        self.recv_base = 0
+        self.recv_buffer = {}  # {seq: payload} for out-of-order
+        self.pending_acks = []  # List of ACKs to send
+        
+    # === SENDER FUNCTIONS ===
+    
     def can_send(self):
-        """Checks whether there is space in the window: next_seq < base + W."""
-        return self.next_seq_num < self.base + self.W
-
-    def send_frame(self, segment_obj, current_time):
-        """Takes a transport segment, adds a link header, and records transmission info."""
-        if self.can_send():
-            # Create frame (Header: 24 bytes)
-            new_frame = Frame(self.next_seq_num, "DATA", segment_obj.pack())
-            
-            # Store transmission info and start timer
-            self.send_window[self.next_seq_num] = {
-                'frame': new_frame,
-                'send_time': current_time,
-                'acked': False
-            }
-            
-            self.next_seq_num += 1
-            return new_frame
+        """Check if sender window has space."""
+        return self.next_seq_num < self.send_base + self.W
+    
+    def get_unacked_count(self):
+        """Return number of unacknowledged frames."""
+        return sum(1 for info in self.send_window.values() if not info['acked'])
+    
+    def create_frame(self, segment, current_time):
+        """Create and register a new frame for transmission."""
+        if not self.can_send():
+            return None
+        
+        frame = Frame(self.next_seq_num, "DATA", segment.pack())
+        
+        self.send_window[self.next_seq_num] = {
+            'frame': frame,
+            'send_time': current_time,
+            'acked': False,
+            'retransmit_count': 0
+        }
+        
+        self.next_seq_num += 1
+        return frame
+    
+    def process_ack(self, ack_seq):
+        """
+        Process received ACK.
+        Returns True if valid, False if duplicate/invalid.
+        """
+        if ack_seq not in self.send_window:
+            return False
+        
+        if self.send_window[ack_seq]['acked']:
+            return False  # Duplicate ACK
+        
+        self.send_window[ack_seq]['acked'] = True
+        
+        # Slide window
+        while self.send_base in self.send_window and self.send_window[self.send_base]['acked']:
+            del self.send_window[self.send_base]
+            self.send_base += 1
+        
+        return True
+    
+    def get_timed_out_frames(self, current_time):
+        """Return list of seq numbers that have timed out."""
+        timed_out = []
+        for seq, info in self.send_window.items():
+            if not info['acked']:
+                if current_time - info['send_time'] > self.timeout_interval:
+                    timed_out.append(seq)
+        return timed_out
+    
+    def prepare_retransmit(self, seq, current_time):
+        """Prepare frame for retransmission, reset timer."""
+        if seq in self.send_window:
+            self.send_window[seq]['send_time'] = current_time
+            self.send_window[seq]['retransmit_count'] += 1
+            return self.send_window[seq]['frame']
         return None
-
-    def handle_ack(self, ack_num):
-        """Processes ACKs received from the receiver and slides the window."""
-        if ack_num in self.send_window:
-            self.send_window[ack_num]['acked'] = True
-            
-            # Selective Repeat: Slide the window if the base frame is acknowledged
-            while self.base in self.send_window and self.send_window[self.base]['acked']:
-                del self.send_window[self.base]
-                self.base += 1
-
-    def check_timeouts(self, current_time):
-        """Finds timed-out packets (only the relevant packet is retransmitted)."""
-        timeouts = []
-        for seq_num, info in self.send_window.items():
-            if not info['acked'] and (current_time - info['send_time'] > self.timeout_interval):
-                timeouts.append(seq_num)
-                # Reset timer
-                info['send_time'] = current_time
-        return timeouts
-
-    # --- Receiver Functions ---
-
-    def receive_data_frame(self, frame_obj):
+    
+    def all_acked(self):
+        """Check if all sent frames are acknowledged."""
+        return len(self.send_window) == 0
+    
+    # === RECEIVER FUNCTIONS ===
+    
+    def receive_frame(self, seq, payload):
         """
-        Accepts out-of-order packets and buffers them.
-        Returns in-order packets to be delivered to the transport layer.
+        Process received data frame (Selective Repeat).
+        Returns: (in_order_payloads, ack_seq)
+        - in_order_payloads: list of (seq, payload) ready for transport layer
+        - ack_seq: sequence number to ACK
         """
-        seq = frame_obj.seq_num
+        in_order = []
         
-        # If the packet is within the window, buffer it
-        if self.expected_seq <= seq < self.expected_seq + self.W:
-            if seq not in self.receive_buffer:
-                self.receive_buffer[seq] = frame_obj.payload
-        
-        # If the expected packet arrives, deliver all consecutive ready packets
-        ready_payloads = []
-        while self.expected_seq in self.receive_buffer:
-            ready_payloads.append(self.receive_buffer.pop(self.expected_seq))
-            self.expected_seq += 1
+        # Check if within receiver window
+        if self.recv_base <= seq < self.recv_base + self.W:
+            # Buffer if not already received
+            if seq not in self.recv_buffer:
+                self.recv_buffer[seq] = payload
             
-        return ready_payloads  # Data to be passed to the transport layer
+            # Collect in-order frames
+            while self.recv_base in self.recv_buffer:
+                in_order.append((self.recv_base, self.recv_buffer[self.recv_base]))
+                del self.recv_buffer[self.recv_base]
+                self.recv_base += 1
+        
+        return in_order, seq
+    
+    def get_recv_base(self):
+        """Return receiver's next expected sequence."""
+        return self.recv_base
