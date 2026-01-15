@@ -8,33 +8,33 @@ def run_experiment():
     test_data = np.random.bytes(TOTAL_DATA_SIZE)
     
     results = []
-    total_runs = len(W_VALUES) * len(L_VALUES)
+    total_runs = len(W_VALUES) * len(L_VALUES) * 10
     run_num = 0
     
-    # 36 Simulations (6W x 6L x 1 Seed)
+    # 360 Simulations (6W x 6L x 10 Seeds)
     for w in W_VALUES:
         for l in L_VALUES:
-            seed = 0
-            run_num += 1
-            print(f"\r[{run_num}/{total_runs}] W={w}, L={l}...", end="", flush=True)
-            
-            engine = SimulationEngine(W=w, L=l, seed=seed)
-            total_time = engine.run(test_data)
-            
-            # Goodput: Only payload bytes / total time
-            goodput_bps = (TOTAL_DATA_SIZE * 8) / total_time
-            
-            results.append({
-                "W": w,
-                "L": l,
-                "seed": seed,
-                "goodput": goodput_bps,
-                "goodput_mbps": goodput_bps / 1e6,
-                "total_time": total_time,
-                "retransmissions": engine.retransmissions,
-                "buffer_events": engine.buffer_events,
-                "delayed_acks": engine.delayed_acks
-            })
+            for seed in range(10):
+                run_num += 1
+                print(f"\r[{run_num}/{total_runs}] W={w}, L={l}, Seed={seed}...", end="", flush=True)
+                
+                engine = SimulationEngine(W=w, L=l, seed=seed)
+                total_time = engine.run(test_data)
+                
+                # Goodput: Only payload bytes / total time
+                goodput_bps = (TOTAL_DATA_SIZE * 8) / total_time
+                
+                results.append({
+                    "W": w,
+                    "L": l,
+                    "seed": seed,
+                    "goodput": goodput_bps,
+                    "goodput_mbps": goodput_bps / 1e6,
+                    "total_time": total_time,
+                    "retransmissions": engine.retransmissions,
+                    "buffer_events": engine.buffer_events,
+                    "delayed_acks": engine.delayed_acks
+                })
 
     df = pd.DataFrame(results)
     df.to_csv("simulation_results.csv", index=False)
