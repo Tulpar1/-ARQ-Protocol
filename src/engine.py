@@ -33,7 +33,7 @@ class SimulationEngine:
         # Initialize layers
         self.phy = PhysicalLayer(seed=seed)
         self.transport = TransportLayer(L)
-        self.link = LinkLayer(W, timeout_interval=0.150)
+        self.link = LinkLayer(W, initial_timeout=0.150)
         
         # Event queue
         self.events = []
@@ -50,6 +50,24 @@ class SimulationEngine:
         self.buffer_events = 0
         self.total_delivered = 0
         self.delayed_acks = 0
+        
+        # RTT and Utilization tracking
+        self.rtt_samples = []
+        self.total_tx_time = 0.0  # Total transmission time (channel busy)
+    
+    @property
+    def avg_rtt(self):
+        """Average RTT from non-retransmitted packets."""
+        if self.rtt_samples:
+            return sum(self.rtt_samples) / len(self.rtt_samples)
+        return 0.0
+    
+    @property
+    def utilization(self):
+        """Channel utilization = total_tx_time / total_time."""
+        if self.current_time > 0:
+            return self.total_tx_time / self.current_time
+        return 0.0
 
     def schedule(self, delay, event_type, data=None):
         """Schedules a new event in the priority queue."""
@@ -96,6 +114,7 @@ class SimulationEngine:
                     )
                     
                     self.link_free_time = tx_start + tx_delay
+                    self.total_tx_time += tx_delay
                     next_seg_idx += 1
             
             # 3. Handle Timeouts: Selective Retransmission
@@ -116,6 +135,7 @@ class SimulationEngine:
                         {'seq': seq, 'payload': orig_payload, 'corrupted': is_corrupted, 'checksum': orig_checksum}
                     )
                     self.link_free_time = tx_start + tx_delay
+                    self.total_tx_time += tx_delay
             
             # 4. Event Processing
             if not self.events:
@@ -175,6 +195,11 @@ class SimulationEngine:
 
     def _handle_ack_arrive(self, seq, frame_bytes):
         """Process the ACK in the Link Layer with Fast Retransmit support."""
+        # Get RTT sample before processing ACK (if available and not retransmitted)
+        if seq in self.link.send_window and not self.link.send_window[seq]['retransmitted']:
+            rtt_sample = self.current_time - self.link.send_window[seq]['send_time']
+            self.rtt_samples.append(rtt_sample)
+        
         trigger_fast_retransmit = self.link.process_ack(seq, self.current_time)
         
         # If 3 duplicate ACKs occur, retransmit the oldest unacked packet immediately

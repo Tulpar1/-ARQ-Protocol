@@ -32,6 +32,8 @@ def run_experiment():
                     "goodput_mbps": goodput_bps / 1e6,
                     "total_time": total_time,
                     "retransmissions": engine.retransmissions,
+                    "avg_rtt": engine.avg_rtt,
+                    "utilization": engine.utilization,
                     "buffer_events": engine.buffer_events,
                     "delayed_acks": engine.delayed_acks
                 })
